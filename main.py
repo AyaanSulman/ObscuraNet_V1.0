@@ -3,6 +3,9 @@ import threading
 import time
 import logging
 import random
+import os
+import sys
+import signal
 from utils import scan_network, get_local_ip, PORT
 from network import (
     try_pow_handshake,
@@ -22,6 +25,20 @@ from crypto import (
 from cryptography.hazmat.primitives import serialization
 
 
+# Terminal colors for better CLI experience
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+
+# Configure logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter("[%(levelname)s] %(message)s")
@@ -32,40 +49,99 @@ if not logging.getLogger().handlers:
     ch.setFormatter(formatter)
     logging.getLogger().addHandler(ch)
 
+# Global flag to signal graceful shutdown
+stop_event = threading.Event()
 
-def dummy_sender_loop(sock, shared_key, stop_event):
+
+# Handle Ctrl+C gracefully
+def signal_handler(sig, frame):
+    print(f"\n{Colors.WARNING}[*] Shutting down ObscuraNet gracefully...{Colors.ENDC}")
+    stop_event.set()
+    # Give a moment for threads to clean up
+    time.sleep(1)
+    sys.exit(0)
+
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def dummy_sender_loop(sock, shared_key, local_stop_event):
     """
     Periodically send a dummy payload until stop_event is set.
     """
     logger.debug("[main/dummy_sender_loop] Entry")
-    while not stop_event.is_set():
+    while not local_stop_event.is_set() and not stop_event.is_set():
         interval = random.randint(10, 30)
         logger.info(f"[main/dummy_sender_loop] Sleeping {interval}s before next dummy")
-        time.sleep(interval)
+        
+        # Check stop_event every second instead of sleeping for the whole interval
+        for _ in range(interval):
+            if local_stop_event.is_set() or stop_event.is_set():
+                break
+            time.sleep(1)
+            
+        if local_stop_event.is_set() or stop_event.is_set():
+            break
+            
         payload = create_dummy_payload()
         try:
             send_message(sock, payload, shared_key, already_encrypted=False)
             logger.info("[main/dummy_sender_loop] Sent dummy payload.")
         except Exception as e:
             logger.error(f"[main/dummy_sender_loop] Failed to send dummy: {e}")
+            # If we can't send messages, the connection is likely broken
+            break
+    
+    logger.debug("[main/dummy_sender_loop] Exiting dummy sender loop.")
+
+
+
+def print_banner():
+    """
+    Display a welcome banner for the ObscuraNet client.
+    """
+    banner = f"""
+{Colors.CYAN}╔══════════════════════════════════════════════════════════════╗
+║ {Colors.BOLD}ObscuraNet P2P Secure Messaging{Colors.ENDC}{Colors.CYAN}                        ║
+║ {Colors.BLUE}Decentralized, Encrypted, Private{Colors.CYAN}                         ║
+╚══════════════════════════════════════════════════════════════╝{Colors.ENDC}
+    """
+    print(banner)
+
+
+def print_help():
+    """
+    Display available commands and their descriptions.
+    """
+    help_text = f"""
+{Colors.CYAN}═══════════════════════ {Colors.BOLD}AVAILABLE COMMANDS{Colors.ENDC}{Colors.CYAN} ═══════════════════════{Colors.ENDC}
+
+{Colors.GREEN}Basic Commands:{Colors.ENDC}
+  {Colors.BOLD}rescan{Colors.ENDC}       - Scan the network for new peers
+  {Colors.BOLD}quickscan{Colors.ENDC}    - Perform a faster scan of common IP ranges
+  {Colors.BOLD}help{Colors.ENDC}         - Display this help message
+  {Colors.BOLD}quit{Colors.ENDC}         - Exit ObscuraNet
+  {Colors.BOLD}<number>{Colors.ENDC}      - Connect to the peer with this number
+
+{Colors.GREEN}When Connected to a Peer:{Colors.ENDC}
+  {Colors.BOLD}back{Colors.ENDC}         - Return to the peer selection menu
+  {Colors.BOLD}direct{Colors.ENDC}       - Send a direct message (no onion routing)
+  {Colors.BOLD}onion{Colors.ENDC}        - Send a message via onion routing (anonymous)
+  """
+    print(help_text)
 
 
 def client_loop():
     """
-    1) Scan LAN for peers.
-    2) Fetch pubkeys of newly discovered peers.
-    3) Let user pick a peer (“rescan” or index).
-    4) Perform PoW+ECDH handshake via try_pow_handshake.
-    5) If connected:
-         - Spawn a dummy‐sender thread.
-         - Loop reading user messages (onion or non-onion).
-         - Handle 'back' or 'quit'.
+    Improved CLI: Always show available commands after peer scan and after returning from a peer session. Add color to peer list and prompts. Handle 'quickscan' and 'help'. Make 'back' and 'quit' robust.
     """
     logger.debug("[main/client_loop] Entry")
     peer_pubkeys = {}
     self_ip = get_local_ip()
 
     while True:
+        print_banner()
         logger.debug("[main/client_loop] Scanning for peers")
         peers = scan_network(PORT)
         healthy_peers = [p for p in peers if routing_table.get(p, {}).get("score", 0) >= 0]
@@ -83,67 +159,86 @@ def client_loop():
 
         # Display
         if not healthy_peers:
-            print("No peers found; type 'rescan' to try again.")
+            print(f"{Colors.WARNING}No peers found; type 'rescan' or 'quickscan' to try again.{Colors.ENDC}")
         else:
-            print("\nAvailable peers:")
+            print(f"\n{Colors.GREEN}Available peers:{Colors.ENDC}")
             for idx, ip in enumerate(healthy_peers, 1):
-                print(f"{idx}: {ip}")
+                print(f"  {Colors.BOLD}{idx}{Colors.ENDC}: {Colors.BLUE}{ip}{Colors.ENDC}")
 
-        choice = input("Choose peer to connect (number) or 'rescan': ").strip()
+        print_help()  # Always show commands
+
+        choice = input(f"{Colors.CYAN}Choose peer (number), or command: {Colors.ENDC}").strip()
         if choice.lower() == "rescan":
             continue
+        if choice.lower() == "quickscan":
+            print(f"{Colors.CYAN}Performing quick scan...{Colors.ENDC}")
+            peers = scan_network(PORT, quick_mode=True)
+            healthy_peers = [p for p in peers if routing_table.get(p, {}).get("score", 0) >= 0]
+            continue
+        if choice.lower() == "help":
+            print_help()
+            continue
+        if choice.lower() == "quit":
+            print(f"{Colors.WARNING}Exiting ObscuraNet...{Colors.ENDC}")
+            sys.exit(0)
 
         try:
             idx = int(choice) - 1
             target_ip = healthy_peers[idx]
             logger.debug(f"[main/client_loop] User selected peer: {target_ip}")
         except Exception:
-            print("Invalid choice.")
+            print(f"{Colors.FAIL}Invalid choice.{Colors.ENDC}")
             continue
 
         logger.info(f"[main/client_loop] Attempting PoW handshake with {target_ip}")
         sock, shared_key = try_pow_handshake(target_ip)
         if not sock:
             logger.error("[main/client_loop] PoW handshake failed.")
+            print(f"{Colors.FAIL}PoW handshake failed. Peer may be offline or unreachable.{Colors.ENDC}")
             continue
 
-        logger.info(f"[main/client_loop] Connected to {target_ip}. You may send messages.")
-        stop_event = threading.Event()
+        print(f"{Colors.GREEN}Connected to {target_ip}. Type 'back' to return to peer list, or 'quit' to exit.{Colors.ENDC}")
+        local_stop_event = threading.Event()
         dummy_thread = threading.Thread(
-            target=dummy_sender_loop, args=(sock, shared_key, stop_event), daemon=True
+            target=dummy_sender_loop, args=(sock, shared_key, local_stop_event), daemon=True
         )
         dummy_thread.start()
         logger.debug("[main/client_loop] Dummy sender thread started.")
 
         while True:
-            msg = input("> You: ").strip()
+            msg = input(f"{Colors.BOLD}> You:{Colors.ENDC} ").strip()
             if msg.lower() == "quit":
                 logger.info("[main/client_loop] User requested quit.")
-                stop_event.set()
+                local_stop_event.set()
                 dummy_thread.join()
                 sock.close()
-                return
+                print(f"{Colors.WARNING}Exiting ObscuraNet...{Colors.ENDC}")
+                sys.exit(0)
             if msg.lower() == "back":
                 logger.info("[main/client_loop] User requested back to peer list.")
-                stop_event.set()
+                local_stop_event.set()
                 dummy_thread.join()
                 sock.close()
+                print(f"{Colors.CYAN}Returning to peer list...{Colors.ENDC}")
                 break
+            if msg.lower() == "help":
+                print_help()
+                continue
             if not msg:
                 continue
 
-            dest = input("Destination IP (blank for direct): ").strip()
+            dest = input(f"{Colors.CYAN}Destination IP (blank for direct): {Colors.ENDC}").strip()
             if not dest:
                 dest = target_ip
             logger.debug(f"[main/client_loop] Message destination set to {dest}")
 
             try:
-                hops = int(input("How many hops (e.g. 2 or 3): ").strip())
+                hops = int(input(f"{Colors.CYAN}How many hops (e.g. 2 or 3): {Colors.ENDC}").strip())
             except Exception:
                 hops = 2
             logger.debug(f"[main/client_loop] Hops chosen: {hops}")
 
-            onion_mode = input("Use onion routing? (y/n): ").strip().lower() == "y"
+            onion_mode = input(f"{Colors.CYAN}Use onion routing? (y/n): {Colors.ENDC}").strip().lower() == "y"
             logger.debug(f"[main/client_loop] Onion mode: {onion_mode}")
 
             if not onion_mode:
@@ -181,7 +276,6 @@ def client_loop():
                 logger.debug(f"[main/client_loop] Built onion blob size={len(onion_blob)}")
                 send_message(sock, onion_blob, session_map[route[0]], already_encrypted=True)
                 logger.info("[main/client_loop] Onion message sent.")
-
         # End of inner while (returned to peer list)
 
 
