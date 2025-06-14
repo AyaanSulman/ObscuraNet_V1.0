@@ -1,0 +1,9 @@
+# Ignore Python cache files and folders
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore the 'keys' directory
+keys/
+pow_sessions.json
+*.zips
