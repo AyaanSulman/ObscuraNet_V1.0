@@ -250,32 +250,49 @@ def client_loop():
                 all_peers = [ip for ip in peer_pubkeys if ip != self_ip]
                 logger.debug(f"[main/client_loop] Available peers for route: {all_peers}")
 
-                if len(all_peers) >= hops:
-                    cands = [p for p in all_peers if p != dest]
-                    route = random.sample(cands, hops - 1)
+                if len(all_peers) < hops:
+                    print(f"{Colors.WARNING}Warning: Requested {hops} hops, but only {len(all_peers)} peers are available. Reducing hops to {len(all_peers)}.{Colors.ENDC}")
+                    hops = len(all_peers)
+                    if hops == 0:
+                        print(f"{Colors.FAIL}No available peers for onion routing!{Colors.ENDC}")
+                        continue
+                cands = [p for p in all_peers if p != dest]
+
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        if len(cands) >= hops - 1:
+                            route = random.sample(cands, hops - 1)
+                        else:
+                            route = random.sample(cands, max(0, len(cands)))
+                        route.append(dest)
+                        logger.info(f"[main/client_loop] Onion route chosen (attempt {attempt+1}): {route}")
+
+                        # Derive each hop's shared key
+                        session_map = {}
+                        for hop in route:
+                            peer_b64 = peer_pubkeys[hop]
+                            peer_pub = load_peer_x25519_pubkey_b64(peer_b64)
+                            shared = derive_shared_key(peer_pub.public_bytes(
+                                encoding=serialization.Encoding.Raw,
+                                format=serialization.PublicFormat.Raw,
+                            ))
+                            session_map[hop] = shared
+                            logger.debug(f"[main/client_loop] Derived key for hop {hop}")
+
+                        payload_dict = {"message": msg, "from": self_ip}
+                        onion_blob = build_onion_envelope(route, session_map, payload_dict)
+                        logger.debug(f"[main/client_loop] Built onion blob size={len(onion_blob)}")
+                        send_message(sock, onion_blob, session_map[route[0]], already_encrypted=True)
+                        logger.info("[main/client_loop] Onion message sent.")
+                        break
+                    except Exception as e:
+                        logger.error(f"[main/client_loop] Failed to send via route {route}: {e}")
+                        print(f"{Colors.WARNING}Failed to send message via selected route. Retrying with a new route...{Colors.ENDC}")
+                        time.sleep(1)
                 else:
-                    cands = [p for p in all_peers if p != dest]
-                    route = random.sample(cands, max(0, len(cands)))
-                route.append(dest)
-                logger.info(f"[main/client_loop] Onion route chosen: {route}")
+                    print(f"{Colors.FAIL}All attempts to send onion message failed!{Colors.ENDC}")
 
-                # Derive each hop's shared key
-                session_map = {}
-                for hop in route:
-                    peer_b64 = peer_pubkeys[hop]
-                    peer_pub = load_peer_x25519_pubkey_b64(peer_b64)
-                    shared = derive_shared_key(peer_pub.public_bytes(
-                        encoding=serialization.Encoding.Raw,
-                        format=serialization.PublicFormat.Raw,
-                    ))
-                    session_map[hop] = shared
-                    logger.debug(f"[main/client_loop] Derived key for hop {hop}")
-
-                payload_dict = {"message": msg, "from": self_ip}
-                onion_blob = build_onion_envelope(route, session_map, payload_dict)
-                logger.debug(f"[main/client_loop] Built onion blob size={len(onion_blob)}")
-                send_message(sock, onion_blob, session_map[route[0]], already_encrypted=True)
-                logger.info("[main/client_loop] Onion message sent.")
         # End of inner while (returned to peer list)
 
 
